@@ -20,22 +20,37 @@ class ArticleContent(BaseModel):
     published_at: Optional[datetime] = None
 
 
+class SummaryBullet(BaseModel):
+    id: str
+    label: str
+    text: str
+    emphasis: str = "analysis"
+
+
+class SummaryData(BaseModel):
+    headline: str
+    bullets: List[SummaryBullet] = Field(default_factory=list)
+
+
 class SummaryResponse(BaseModel):
     article: ArticleContent
-    summary: str
+    summary: SummaryData
 
 
 class QuoteRequest(BaseModel):
     article: ArticleContent
     debate_topic: str = Field(default="")
+    custom_instructions: str = Field(default="", max_length=300)
 
 
 class QuoteItem(BaseModel):
     id: str
     quote: str
-    context: str
-    implication: str
+    paragraph: str
+    why_it_matters: str
     order: int
+    paragraph_index: int = 0
+    coverage_label: str = ""
 
 
 class QuotesResponse(BaseModel):
@@ -45,6 +60,7 @@ class QuotesResponse(BaseModel):
 class CardRequest(BaseModel):
     article: ArticleContent
     debate_topic: str = Field(default="")
+    custom_instructions: str = Field(default="", max_length=300)
     selected_quotes: List[str] = Field(default_factory=list)
 
 
@@ -57,17 +73,23 @@ class CredibilityHeader(BaseModel):
     relay_evidence_note: str = ""
 
 
+class CardOption(BaseModel):
+    id: str
+    label: str
+    format: str
+    tag: str
+    primary_warrant_quote_index: int = 0
+
+
 class CardResponse(BaseModel):
     credibility: CredibilityHeader
-    tag: str
     cite: str
-    primary_warrant_quote_index: int = 0
-    bolded_quotes: List[str] = Field(default_factory=list)
+    options: List[CardOption] = Field(default_factory=list)
 
 
 class ExportQuoteBlock(BaseModel):
-    text: str
-    sentence_highlights: List[bool] = Field(default_factory=list)
+    paragraph_text: str
+    quote_text: str
 
 
 class ExportRequest(BaseModel):
@@ -75,4 +97,5 @@ class ExportRequest(BaseModel):
     cite: str
     source_url: Optional[str] = None
     primary_warrant_quote_index: int = 0
+    format_variant: str = "classic"
     quote_blocks: List[ExportQuoteBlock] = Field(default_factory=list)

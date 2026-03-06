@@ -24,23 +24,28 @@ export async function fetchSummary(url, debateTopic) {
   return ok.json();
 }
 
-export async function fetchQuotes(article, debateTopic) {
+export async function fetchQuotes(article, debateTopic, customInstructions) {
   const response = await fetch(`${API_BASE}/api/quotes`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ article, debate_topic: debateTopic }),
+    body: JSON.stringify({
+      article,
+      debate_topic: debateTopic,
+      custom_instructions: customInstructions,
+    }),
   });
   const ok = await handleResponse(response);
   return ok.json();
 }
 
-export async function buildCard(article, debateTopic, selectedQuotes) {
+export async function buildCard(article, debateTopic, selectedQuotes, customInstructions) {
   const response = await fetch(`${API_BASE}/api/card`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       article,
       debate_topic: debateTopic,
+      custom_instructions: customInstructions,
       selected_quotes: selectedQuotes,
     }),
   });
@@ -48,7 +53,7 @@ export async function buildCard(article, debateTopic, selectedQuotes) {
   return ok.json();
 }
 
-export async function exportCard(tag, cite, sourceUrl, primaryWarrantQuoteIndex, quoteBlocks) {
+export async function exportCard(tag, cite, sourceUrl, primaryWarrantQuoteIndex, formatVariant, quoteBlocks) {
   const response = await fetch(`${API_BASE}/api/export`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -57,6 +62,7 @@ export async function exportCard(tag, cite, sourceUrl, primaryWarrantQuoteIndex,
       cite,
       source_url: sourceUrl,
       primary_warrant_quote_index: primaryWarrantQuoteIndex,
+      format_variant: formatVariant,
       quote_blocks: quoteBlocks,
     }),
   });

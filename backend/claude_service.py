@@ -3,10 +3,11 @@ from __future__ import annotations
 import os
 import re
 from typing import List
+from urllib.parse import urlparse
 
 from anthropic import Anthropic
 
-from models import ArticleContent, CardResponse, CredibilityHeader, QuoteItem
+from models import CardOption, CardResponse, CredibilityHeader, QuoteItem, SummaryBullet, SummaryData
 
 MODEL_NAME = "claude-sonnet-4-20250514"
 
@@ -51,56 +52,145 @@ class ClaudeService:
         return match.group(1).strip()
 
     @staticmethod
-    def _extract_many(xml_text: str, parent_tag: str, child_tag: str) -> List[str]:
-        parent = ClaudeService._extract_single_tag(xml_text, parent_tag)
-        return [
-            value.strip()
-            for value in re.findall(
-                rf"<{child_tag}>(.*?)</{child_tag}>",
-                parent,
-                flags=re.DOTALL | re.IGNORECASE,
-            )
-            if value.strip()
-        ]
-
-    @staticmethod
-    def _enforce_single_bold_segment(text: str) -> str:
-        matches = list(re.finditer(r"\*\*.+?\*\*", text))
-        if len(matches) <= 1:
-            return text
-
-        first_end = matches[0].end()
-        suffix = text[first_end:].replace("**", "")
-        return f"{text[:first_end]}{suffix}"
-
-    @staticmethod
     def _extract_optional_tag(xml_text: str, tag: str, default: str = "") -> str:
         match = re.search(rf"<{tag}>(.*?)</{tag}>", xml_text, flags=re.DOTALL | re.IGNORECASE)
         if not match:
             return default
         return match.group(1).strip()
 
-    def summarize_article(self, article: ArticleContent, debate_topic: str) -> str:
+    @staticmethod
+    def _normalize_text(text: str) -> str:
+        translated = (
+            text.replace("“", '"')
+            .replace("”", '"')
+            .replace("’", "'")
+            .replace("‘", "'")
+            .replace("–", "-")
+            .replace("—", "-")
+        )
+        translated = re.sub(r"\s+", " ", translated)
+        return translated.strip()
+
+    @staticmethod
+    def _strip_summary_openers(text: str) -> str:
+        cleaned = text.strip()
+        cleaned = re.sub(
+            r"^(the\s+author|the\s+article|the\s+piece|the\s+report)\s+(says|argues|writes|notes|claims|contends|explains)\s+(that\s+)?",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(r"^[A-Z][a-z]+\s+(says|argues|writes|notes|claims|contends|explains)\s+(that\s+)?", "", cleaned)
+        return cleaned[:1].upper() + cleaned[1:] if cleaned else ""
+
+    @staticmethod
+    def _segment_article(text: str) -> List[str]:
+        raw_parts = [part.strip() for part in re.split(r"\n+", text) if part.strip()]
+        segments: List[str] = []
+
+        if len(raw_parts) >= 5:
+            buffer = ""
+            for part in raw_parts:
+                candidate = f"{buffer} {part}".strip() if buffer else part
+                if buffer and len(candidate) > 950:
+                    segments.append(buffer)
+                    buffer = part
+                else:
+                    buffer = candidate
+            if buffer:
+                segments.append(buffer)
+        else:
+            sentences = [item.strip() for item in re.split(r"(?<=[.!?])\s+", text) if item.strip()]
+            chunk: List[str] = []
+            current_length = 0
+            for sentence in sentences:
+                chunk.append(sentence)
+                current_length += len(sentence)
+                if len(chunk) >= 4 or current_length > 750:
+                    segments.append(" ".join(chunk))
+                    chunk = []
+                    current_length = 0
+            if chunk:
+                segments.append(" ".join(chunk))
+
+        return [segment for segment in segments if len(segment) > 120]
+
+    @staticmethod
+    def _format_segmented_article(segments: List[str]) -> str:
+        return "\n\n".join(f"[P{index}] {segment}" for index, segment in enumerate(segments, start=1))
+
+    @staticmethod
+    def _resolve_quote_segment(quote_text: str, paragraph_index: int, segments: List[str]) -> tuple[int, str] | None:
+        normalized_quote = ClaudeService._normalize_text(quote_text)
+        if not normalized_quote:
+            return None
+
+        preferred_indexes = list(range(len(segments)))
+        if 1 <= paragraph_index <= len(segments):
+            preferred_indexes = [paragraph_index - 1] + [idx for idx in preferred_indexes if idx != paragraph_index - 1]
+
+        for idx in preferred_indexes:
+            segment = segments[idx]
+            if normalized_quote in ClaudeService._normalize_text(segment):
+                return idx + 1, segment
+
+        return None
+
+    @staticmethod
+    def _coverage_label(paragraph_index: int, total_segments: int) -> str:
+        if total_segments <= 1:
+            return "Full article"
+        ratio = paragraph_index / total_segments
+        if ratio <= 0.34:
+            return "Early article"
+        if ratio <= 0.67:
+            return "Middle article"
+        return "Late article"
+
+    @staticmethod
+    def _hostname_label(url: str) -> str:
+        hostname = urlparse(url).hostname or url
+        return hostname.removeprefix("www.")
+
+    @staticmethod
+    def _build_cite(article) -> str:
+        if article.authors:
+            author_part = article.authors[0]
+            if len(article.authors) > 1:
+                author_part = f"{article.authors[0]} et al."
+        else:
+            author_part = article.publication or ClaudeService._hostname_label(article.url)
+
+        year = str(article.published_at.year) if article.published_at else "n.d."
+        publication = article.publication or ClaudeService._hostname_label(article.url)
+        return f"{author_part} {year}, {publication}, {article.title}, {article.url}"
+
+    def summarize_article(self, article, debate_topic: str) -> SummaryData:
         system_prompt = (
-            "You are a debate research assistant. You write concise, accurate prose briefings "
-            "for competitive debaters."
+            "You are a debate research assistant. You write accurate, specific bullet briefs for competitive debaters."
         )
 
         user_prompt = f"""
 Summarize the article for a debater.
 
-Return XML only, with this exact schema:
+Return XML only, using this exact structure:
 <summary>
-2-3 paragraphs of plain-English flowing prose. No bullet points.
-Paragraph 1: what the author argues.
-Paragraph 2: what evidence/warrants the author uses.
-Paragraph 3 (optional): what conclusion and implications the author reaches.
+  <headline>One sharp sentence describing the article's central takeaway.</headline>
+  <bullets>
+    <bullet>
+      <label>Short heading like Claim, Warrant, Stat, Impact, Mechanism, or Limit.</label>
+      <emphasis>claim|warrant|stat|impact|analysis</emphasis>
+      <text>Detailed bullet. Start with the substance, not attribution. Avoid phrases like "the author says" or "the article argues".</text>
+    </bullet>
+  </bullets>
 </summary>
 
 Hard constraints:
+- Return 5 to 7 bullets.
 - Use only information from the provided article text.
-- Do not invent claims or facts.
-- Maintain analytical clarity and concrete language.
+- Keep bullets concrete and debater-friendly.
+- Pull out numbers, percentages, dates, and quantities as separate `stat` bullets when present.
+- Avoid vague attribution framing.
 - Keep relevance anchored to the debate topic when provided.
 
 Article metadata:
@@ -114,13 +204,39 @@ Article text:
 {article.text}
 """.strip()
 
-        raw = self._call(system_prompt, user_prompt, max_tokens=1400)
-        return self._extract_single_tag(raw, "summary")
+        raw = self._call(system_prompt, user_prompt, max_tokens=1800)
+        headline = self._extract_single_tag(raw, "headline")
+        bullets_block = self._extract_single_tag(raw, "bullets")
+        bullet_xml = re.findall(r"<bullet>(.*?)</bullet>", bullets_block, flags=re.DOTALL | re.IGNORECASE)
 
-    def extract_relevant_quotes(self, article: ArticleContent, debate_topic: str) -> List[QuoteItem]:
+        bullets: List[SummaryBullet] = []
+        for idx, block in enumerate(bullet_xml, start=1):
+            label = self._extract_optional_tag(block, "label", "Point")
+            emphasis = self._extract_optional_tag(block, "emphasis", "analysis").lower()
+            text = self._strip_summary_openers(self._extract_single_tag(block, "text"))
+            if not text:
+                continue
+            bullets.append(
+                SummaryBullet(
+                    id=f"b{idx}",
+                    label=label,
+                    text=text,
+                    emphasis=emphasis if emphasis in {"claim", "warrant", "stat", "impact", "analysis"} else "analysis",
+                )
+            )
+
+        if not bullets:
+            raise ClaudeResponseError("No summary bullets returned by Claude")
+
+        return SummaryData(headline=headline, bullets=bullets[:7])
+
+    def extract_relevant_quotes(self, article, debate_topic: str, custom_instructions: str = "") -> List[QuoteItem]:
+        segments = self._segment_article(article.text)
+        if not segments:
+            raise ClaudeResponseError("Article text was too short to extract paragraph-level evidence")
+
         system_prompt = (
-            "You are an expert debate evidence cutter. You identify verbatim evidence lines that "
-            "matter in rounds and preserve chronological order from source text."
+            "You are an expert debate evidence cutter. You pull verbatim evidence from across the full article and preserve source fidelity."
         )
 
         user_prompt = f"""
@@ -130,100 +246,116 @@ Return XML only with this exact structure:
 <quotes>
   <quote>
     <order>1</order>
-    <text>VERBATIM quote, full sentence(s), unchanged from source.</text>
-    <context>Where this fits in the author's argument.</context>
-    <implication>What this proves in a debate round, plain English.</implication>
+    <paragraph_index>1</paragraph_index>
+    <text>VERBATIM quote, contiguous, unchanged from the paragraph.</text>
+    <why_it_matters>One sentence explaining the debate value of the quote.</why_it_matters>
   </quote>
 </quotes>
 
 Hard constraints:
-- Return 4 to 10 quotes max.
-- Quotes must be verbatim from article text.
-- Keep quotes in chronological order as they appear in source.
-- Include only lines with a claim, warrant, statistic, or concrete impact.
-- Exclude setup/filler/background lines unless directly argumentative.
-- Do not merge distant sentences; keep each quote contiguous in source.
-- Prioritize quotes most useful for the provided debate topic.
-- Prefer independent factual claims, statistics, and named-source assertions.
-- De-prioritize relay-only accusations unless they are uniquely strategic evidence.
+- Return 5 to 8 quotes max.
+- Each quote must be verbatim and fully contained inside one numbered paragraph block.
+- Pull evidence from across the article, not just the beginning.
+- When the article has at least 6 paragraph blocks, use at least 3 distinct paragraph indexes.
+- Prefer claim, warrant, impact, and stat-heavy lines.
+- Keep quotes in source order.
+- Keep `why_it_matters` concise and non-redundant.
+- Follow any user customization focus when it does not contradict the article.
 
-Article metadata:
-Title: {article.title}
-URL: {article.url}
 Debate topic: {debate_topic or "Not provided"}
+Customization focus: {custom_instructions or "None"}
 
-Article text:
-{article.text}
+Paragraph blocks:
+{self._format_segmented_article(segments)}
 """.strip()
 
-        raw = self._call(system_prompt, user_prompt, max_tokens=2400)
+        raw = self._call(system_prompt, user_prompt, max_tokens=2800)
         quote_blocks = re.findall(r"<quote>(.*?)</quote>", raw, flags=re.DOTALL | re.IGNORECASE)
         if not quote_blocks:
             raise ClaudeResponseError("No <quote> blocks returned by Claude")
 
         quotes: List[QuoteItem] = []
+        seen_quotes: set[str] = set()
         for idx, block in enumerate(quote_blocks, start=1):
-            order = self._extract_single_tag(block, "order") if re.search(r"<order>", block) else str(idx)
-            text = self._extract_single_tag(block, "text")
-            context = self._extract_single_tag(block, "context")
-            implication = self._extract_single_tag(block, "implication")
+            order_text = self._extract_optional_tag(block, "order", str(idx))
+            paragraph_index_text = self._extract_optional_tag(block, "paragraph_index", "1")
+            quote_text = self._extract_single_tag(block, "text")
+            why_it_matters = self._extract_single_tag(block, "why_it_matters")
+
+            resolved = self._resolve_quote_segment(
+                quote_text,
+                int(paragraph_index_text) if paragraph_index_text.isdigit() else 1,
+                segments,
+            )
+            if not resolved:
+                continue
+
+            resolved_paragraph_index, paragraph = resolved
+            normalized_quote = self._normalize_text(quote_text)
+            if normalized_quote in seen_quotes:
+                continue
+            seen_quotes.add(normalized_quote)
+
             quotes.append(
                 QuoteItem(
                     id=f"q{idx}",
-                    quote=text,
-                    context=context,
-                    implication=implication,
-                    order=int(order) if order.isdigit() else idx,
+                    quote=quote_text.strip(),
+                    paragraph=paragraph,
+                    why_it_matters=why_it_matters.strip(),
+                    order=int(order_text) if order_text.isdigit() else idx,
+                    paragraph_index=resolved_paragraph_index,
+                    coverage_label=self._coverage_label(resolved_paragraph_index, len(segments)),
                 )
             )
 
-        quotes.sort(key=lambda q: q.order)
-        return quotes
+        quotes.sort(key=lambda item: (item.paragraph_index, item.order))
+        if not quotes:
+            raise ClaudeResponseError("Claude did not return verifiable quotes from the article text")
+        return quotes[:8]
 
-    def build_card(self, article: ArticleContent, debate_topic: str, selected_quotes: List[str]) -> CardResponse:
+    def build_card(self, article, debate_topic: str, selected_quotes: List[str], custom_instructions: str = "") -> CardResponse:
         if not selected_quotes:
             raise ClaudeResponseError("At least one selected quote is required to build a card")
+        if len(selected_quotes) > 4:
+            raise ClaudeResponseError("Select no more than 4 quote blocks per card")
 
         quoted_block = "\n\n".join(f"[{i}] {quote}" for i, quote in enumerate(selected_quotes, start=1))
 
         system_prompt = (
-            "You are a national-circuit debate coach producing card-ready outputs. "
-            "Be defensible in cross-ex and avoid fabricated credentials."
+            "You are a national-circuit debate coach producing card-ready outputs. Be conservative, defensible, and do not invent credentials."
         )
 
         user_prompt = f"""
-Create card metadata from article + selected quotes.
+Create card metadata from the selected quotes.
 
 Return XML only using this exact structure:
 <card>
   <credibility>
     <author_name>Primary author name (or Unknown).</author_name>
-    <credentials>Professional credentials relevant to topic; if unclear, say "Not clearly stated in source".</credentials>
-    <affiliation>Institution/publication affiliation; if unclear, say "Not clearly stated in source".</affiliation>
+    <credentials>Only credentials clearly stated in metadata/text; otherwise "Not clearly stated in source".</credentials>
+    <affiliation>Only affiliation clearly stated in metadata/text; otherwise "Not clearly stated in source".</affiliation>
     <defensibility>One-line cross-ex defensibility assessment.</defensibility>
     <bias_flags>Potential bias/conflict notes, concise.</bias_flags>
-    <relay_evidence_note>Explicitly state whether this card relies on reporter-relayed claims vs independent expert/factual reporting.</relay_evidence_note>
+    <relay_evidence_note>State whether this is direct reporting/expert evidence or reporter-relayed claims.</relay_evidence_note>
   </credibility>
-  <tag>One sentence argumentative claim in debate language.</tag>
-  <cite>Single line cite string with author last name + year first, then credentials/publication, and URL at end.</cite>
-  <primary_warrant_quote_index>1-based index of the single quote containing the strongest standalone warrant across all selected quotes.</primary_warrant_quote_index>
-  <bolded_quotes>
-    <quote>Each selected quote with exactly one most-standalone warrant phrase wrapped in **double asterisks**.</quote>
-  </bolded_quotes>
+  <options>
+    <option>
+      <label>Short label for the card option.</label>
+      <format>classic|spotlight|brief</format>
+      <tag>One sentence argumentative claim directly supported by the selected quotes.</tag>
+      <primary_warrant_quote_index>1</primary_warrant_quote_index>
+    </option>
+  </options>
 </card>
 
 Hard constraints:
-- Use only data inferable from article metadata/text.
-- Never invent credentials; explicitly mark unknown when needed.
-- Keep tag concise, assertive, and argumentative.
-- Tag must only claim what selected quote text directly proves; do not extrapolate legal conclusions or causal chains.
-- If evidence is journalist reporting someone else's statement, frame tag as characterization/reporting, not established fact/precedent.
-- Preserve exact quote wording; only add **bold markers** around key phrases.
-- Return the same number of <quote> entries as provided selected quotes.
-- Make the tag explicitly relevant to the debate topic.
-- In each quote, highlight exactly one phrase (single **...** segment) with maximal standalone argumentative weight.
-- Choose primary_warrant_quote_index based on structural warrant importance, not chronology.
-- If relay evidence is present, relay_evidence_note must explicitly say so (e.g., reporter citing official statement, not independent expert).
+- Return exactly 3 options.
+- The options must use the same evidence but offer different tag phrasings or framing emphasis.
+- Do not overclaim beyond what the selected quotes directly prove.
+- Make the tag relevant to the debate topic and user customization when possible.
+- Keep every option concise and cross-ex defensible.
+- Choose `primary_warrant_quote_index` based on which selected quote does the most structural argumentative work.
+- Never invent credentials or affiliation details.
 
 Article metadata:
 Title: {article.title}
@@ -232,6 +364,7 @@ Authors: {", ".join(article.authors) if article.authors else "Unknown"}
 Publication: {article.publication or "Unknown"}
 Published at: {article.published_at.isoformat() if article.published_at else "Unknown"}
 Debate topic: {debate_topic or "Not provided"}
+Customization focus: {custom_instructions or "None"}
 
 Selected quotes:
 {quoted_block}
@@ -253,23 +386,44 @@ Selected quotes:
             ),
         )
 
-        tag = self._extract_single_tag(raw, "tag")
-        cite = self._extract_single_tag(raw, "cite")
-        primary_warrant_index_text = self._extract_optional_tag(raw, "primary_warrant_quote_index", "1")
-        primary_warrant_index = int(primary_warrant_index_text) if primary_warrant_index_text.isdigit() else 1
-        bolded_quotes = self._extract_many(raw, "bolded_quotes", "quote")
-        bolded_quotes = [self._enforce_single_bold_segment(quote) for quote in bolded_quotes]
-        if len(bolded_quotes) != len(selected_quotes):
-            # Keep UX stable if model returns fewer rows.
-            bolded_quotes = (bolded_quotes + selected_quotes)[: len(selected_quotes)]
+        option_block = self._extract_single_tag(raw, "options")
+        option_xml = re.findall(r"<option>(.*?)</option>", option_block, flags=re.DOTALL | re.IGNORECASE)
+        options: List[CardOption] = []
+        for idx, block in enumerate(option_xml, start=1):
+            label = self._extract_optional_tag(block, "label", f"Option {idx}")
+            format_name = self._extract_optional_tag(block, "format", "classic").lower()
+            tag = self._extract_single_tag(block, "tag")
+            primary_text = self._extract_optional_tag(block, "primary_warrant_quote_index", "1")
+            primary_index = int(primary_text) - 1 if primary_text.isdigit() else 0
+            if primary_index < 0 or primary_index >= len(selected_quotes):
+                primary_index = 0
+            options.append(
+                CardOption(
+                    id=f"option-{idx}",
+                    label=label,
+                    format=format_name if format_name in {"classic", "spotlight", "brief"} else "classic",
+                    tag=tag,
+                    primary_warrant_quote_index=primary_index,
+                )
+            )
 
-        if primary_warrant_index < 1 or primary_warrant_index > len(selected_quotes):
-            primary_warrant_index = 1
+        if len(options) < 3:
+            fallback_formats = ["classic", "spotlight", "brief"]
+            base_tag = options[0].tag if options else "Selected evidence supports the article's core claim."
+            while len(options) < 3:
+                option_number = len(options) + 1
+                options.append(
+                    CardOption(
+                        id=f"option-{option_number}",
+                        label=f"Option {option_number}",
+                        format=fallback_formats[len(options) % len(fallback_formats)],
+                        tag=base_tag,
+                        primary_warrant_quote_index=0,
+                    )
+                )
 
         return CardResponse(
             credibility=credibility,
-            tag=tag,
-            cite=cite,
-            primary_warrant_quote_index=primary_warrant_index - 1,
-            bolded_quotes=bolded_quotes,
+            cite=self._build_cite(article),
+            options=options[:3],
         )

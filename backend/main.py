@@ -58,7 +58,11 @@ def summarize(payload: UrlRequest) -> SummaryResponse:
 @app.post("/api/quotes", response_model=QuotesResponse)
 def quotes(payload: QuoteRequest) -> QuotesResponse:
     try:
-        items = get_claude().extract_relevant_quotes(payload.article, payload.debate_topic.strip())
+        items = get_claude().extract_relevant_quotes(
+            payload.article,
+            payload.debate_topic.strip(),
+            payload.custom_instructions.strip(),
+        )
         return QuotesResponse(quotes=items)
     except ClaudeResponseError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -69,15 +73,16 @@ def quotes(payload: QuoteRequest) -> QuotesResponse:
 @app.post("/api/card", response_model=CardResponse)
 def build_card(payload: CardRequest) -> CardResponse:
     try:
-        return get_claude().build_card(payload.article, payload.debate_topic.strip(), payload.selected_quotes)
+        return get_claude().build_card(
+            payload.article,
+            payload.debate_topic.strip(),
+            payload.selected_quotes,
+            payload.custom_instructions.strip(),
+        )
     except ClaudeResponseError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Unexpected error: {exc}") from exc
-
-
-def _split_sentences(text: str) -> list[str]:
-    return [item.strip() for item in re.split(r"(?<=[.!?])\s+", text) if item.strip()]
 
 
 def _parse_cite(cite: str, source_url: Optional[str]) -> tuple[str, str]:
@@ -95,29 +100,123 @@ def _parse_cite(cite: str, source_url: Optional[str]) -> tuple[str, str]:
     return lead_chunk, details
 
 
-def _append_sentence(paragraph, sentence: str, emphasized: bool, primary_warrant: bool) -> None:
-    parts = sentence.split("**")
-    for idx, part in enumerate(parts):
-        if not part:
-            continue
+def _normalize_for_match(text: str) -> str:
+    return (
+        text.replace("“", '"')
+        .replace("”", '"')
+        .replace("’", "'")
+        .replace("‘", "'")
+        .replace("–", "-")
+        .replace("—", "-")
+    )
 
-        run = paragraph.add_run(part)
-        run.font.name = "Times New Roman"
 
-        if emphasized:
-            run.bold = True
-            run.underline = True
-            run.font.size = Pt(16 if primary_warrant else 14)
-            run.font.color.rgb = RGBColor(0, 0, 0)
-            if idx % 2 == 1:
-                run.font.highlight_color = WD_COLOR_INDEX.BRIGHT_GREEN
-        else:
-            run.bold = False
-            run.underline = False
-            run.font.size = Pt(8)
-            run.font.color.rgb = RGBColor(120, 120, 120)
+def _find_quote_span(paragraph_text: str, quote_text: str) -> tuple[int, int] | None:
+    normalized_paragraph = _normalize_for_match(paragraph_text)
+    normalized_quote = _normalize_for_match(quote_text).strip().strip('"').strip("'")
+    tokens = normalized_quote.split()
+    if not tokens:
+        return None
 
-    paragraph.add_run(" ")
+    pattern = re.compile(r"\s+".join(re.escape(token) for token in tokens), flags=re.IGNORECASE)
+    match = pattern.search(normalized_paragraph)
+    if not match:
+        return None
+    return match.start(), match.end()
+
+
+def _style_run(run, *, bold: bool, underline: bool, size: int, color: RGBColor, highlight=None) -> None:
+    run.font.name = "Times New Roman"
+    run.bold = bold
+    run.underline = underline
+    run.font.size = Pt(size)
+    run.font.color.rgb = color
+    if highlight is not None:
+        run.font.highlight_color = highlight
+
+
+def _append_context_and_quote(paragraph, paragraph_text: str, quote_text: str, primary: bool, format_variant: str) -> None:
+    span = _find_quote_span(paragraph_text, quote_text)
+    size_map = {"classic": (14, 15), "spotlight": (13, 16), "brief": (13, 14)}
+    context_size, quote_size = size_map.get(format_variant, (14, 15))
+    if primary:
+        context_size += 1
+        quote_size += 1
+
+    context_bold = format_variant != "brief"
+    context_color = RGBColor(0, 0, 0)
+    quote_highlight = WD_COLOR_INDEX.YELLOW if format_variant == "spotlight" else WD_COLOR_INDEX.BRIGHT_GREEN
+
+    if not span:
+        context_run = paragraph.add_run(paragraph_text.strip())
+        _style_run(
+            context_run,
+            bold=context_bold,
+            underline=True,
+            size=context_size,
+            color=context_color,
+        )
+        paragraph.add_run(" ")
+        open_quote = paragraph.add_run('"')
+        _style_run(open_quote, bold=True, underline=True, size=quote_size, color=context_color)
+        quote_run = paragraph.add_run(quote_text.strip().strip('"').strip("'"))
+        _style_run(
+            quote_run,
+            bold=True,
+            underline=True,
+            size=quote_size,
+            color=context_color,
+            highlight=quote_highlight,
+        )
+        close_quote = paragraph.add_run('"')
+        _style_run(close_quote, bold=True, underline=True, size=quote_size, color=context_color)
+        return
+
+    start, end = span
+    before = paragraph_text[:start]
+    quote = paragraph_text[start:end]
+    after = paragraph_text[end:]
+
+    if before.endswith(("“", '"', "‘", "'")) and after.startswith(("”", '"', "’", "'")):
+        before = before[:-1]
+        after = after[1:]
+        quote = quote.strip().strip('"').strip("'")
+
+    if before:
+        before_run = paragraph.add_run(before)
+        _style_run(
+            before_run,
+            bold=context_bold,
+            underline=True,
+            size=context_size,
+            color=context_color,
+        )
+
+    open_quote = paragraph.add_run('"')
+    _style_run(open_quote, bold=True, underline=True, size=quote_size, color=context_color)
+
+    quote_run = paragraph.add_run(quote.strip().strip('"').strip("'"))
+    _style_run(
+        quote_run,
+        bold=True,
+        underline=True,
+        size=quote_size,
+        color=context_color,
+        highlight=quote_highlight,
+    )
+
+    close_quote = paragraph.add_run('"')
+    _style_run(close_quote, bold=True, underline=True, size=quote_size, color=context_color)
+
+    if after:
+        after_run = paragraph.add_run(after)
+        _style_run(
+            after_run,
+            bold=context_bold,
+            underline=True,
+            size=context_size,
+            color=context_color,
+        )
 
 
 @app.post("/api/export")
@@ -159,17 +258,13 @@ def export_card(payload: ExportRequest) -> StreamingResponse:
         p.paragraph_format.space_before = Pt(0)
         p.paragraph_format.space_after = Pt(0)
         p.paragraph_format.line_spacing = 1.0
-        sentences = _split_sentences(block.text.strip())
-        sentence_toggles = block.sentence_highlights or [True] * len(sentences)
-        is_primary_warrant_quote = quote_index == primary_index
-        for idx, sentence in enumerate(sentences):
-            is_emphasized = sentence_toggles[idx] if idx < len(sentence_toggles) else True
-            _append_sentence(
-                p,
-                sentence,
-                is_emphasized,
-                primary_warrant=is_primary_warrant_quote and is_emphasized,
-            )
+        _append_context_and_quote(
+            p,
+            block.paragraph_text.strip(),
+            block.quote_text.strip(),
+            primary=quote_index == primary_index,
+            format_variant=payload.format_variant,
+        )
 
     stream = BytesIO()
     doc.save(stream)
